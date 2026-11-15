@@ -4,7 +4,7 @@
 
 1. Подключаем ПК к роутеру кабелем и задаём сетевой карте IP `192.168.1.254`, маску `255.255.255.0`. Шлюз и DNS не нужны.
 2. На заводской прошивке через веб-интерфейс задаём пароль администратора `root` и проверяем, что доступен SSH.
-3. Кладём `flash-netis.ps1`, `plink.exe`, архив `tftpd64_portable_v4.74.zip` и три официальных образа для **Netis N6 v2** в одну папку: `bl31-uboot.fip`, `initramfs-recovery.itb` и `squashfs-sysupgrade.itb`. Plink и архив Tftpd64 уже включены в комплект; скрипт проверит их по SHA-256. PSCP скрипт скачает сам, если его нет рядом.
+3. Кладём `flash-netis.ps1`, `plink.exe`, `pscp.exe`, архив `tftpd64_portable_v4.74.zip` и три официальных образа для **Netis N6 v2** в одну папку: `bl31-uboot.fip`, `initramfs-recovery.itb` и `squashfs-sysupgrade.itb`. Plink, PSCP и архив Tftpd64 уже включены в комплект; скрипт проверит их по SHA-256.
 4. Открываем PowerShell в этой папке и запускаем:
 
    ```powershell
