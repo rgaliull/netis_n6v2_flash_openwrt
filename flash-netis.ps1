@@ -16,6 +16,12 @@ $TftpDir = Join-Path $WorkDir 'Tftpd64'
 $TftpZip = Join-Path $WorkDir 'tftpd64_portable_v4.74.zip'
 $TftpUrl = 'https://github.com/PJO2/tftpd64/releases/download/v4.74/tftpd64_portable_v4.74.zip'
 $TftpZipHash = '3ad38a71c0d7d42915429f8f02945e27bcf88161ad1028980d1364af8f76bf22'
+$PlinkPath = Join-Path $WorkDir 'plink.exe'
+$PscpPath = Join-Path $WorkDir 'pscp.exe'
+$PlinkUrl = 'https://the.earth.li/~sgtatham/putty/0.85/w64/plink.exe'
+$PscpUrl = 'https://the.earth.li/~sgtatham/putty/0.85/w64/pscp.exe'
+$PlinkHash = '969f36879d5716aa1a9811f43a6a6510e8f08372dbeb9695b810b9c776f39c75'
+$PscpHash = '4275310c04b4dd00cc139f93b932267df7816fda8e362d4a845660129264f3a1'
 $Images = @{
     $Fip        = @{ Hash = '3d60e1bd9594593c89f2dee178a43afa0f4ffc2b0293ef36893212c81ffe0ca4'; Bytes = 809180 }
     $Recovery   = @{ Hash = 'c2bf08cfdfbb8e25c92c9ff6c962992a1c4fcac6df1fe676e046c665641069f1'; Bytes = 9240576 }
@@ -23,6 +29,8 @@ $Images = @{
     $Preloader  = @{ Hash = '73416264bd5ff59fe447cbbb9f756b8ed7e258f4ef48a296773240c11b7bc79b'; Bytes = 230232 }
 }
 $script:UseNoPasswordAuth = $false
+$script:PasswordFile = $null
+$script:SshKeyScanPath = $null
 $script:TftpProcess = $null
 $script:TftpExePath = $null
 $script:FlashCompleted = $false
@@ -40,21 +48,45 @@ function Require-Image([string]$Name) {
     return $path
 }
 
+function Get-PuTTYTools {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    foreach ($tool in @(
+        @{ Path = $PlinkPath; Url = $PlinkUrl; Hash = $PlinkHash; Name = 'Plink' },
+        @{ Path = $PscpPath; Url = $PscpUrl; Hash = $PscpHash; Name = 'PSCP' }
+    )) {
+        if (-not (Test-Path -LiteralPath $tool.Path -PathType Leaf) -or (Get-FileHash -LiteralPath $tool.Path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $tool.Hash) {
+            Write-Host "$($tool.Name) 0.85 отсутствует или отличается; скачиваю официальный файл..."
+            Invoke-WebRequest -Uri $tool.Url -OutFile $tool.Path -UseBasicParsing
+        }
+        if ((Get-FileHash -LiteralPath $tool.Path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $tool.Hash) {
+            Remove-Item -LiteralPath $tool.Path -Force -ErrorAction SilentlyContinue
+            throw "$($tool.Name) не прошёл проверку SHA-256."
+        }
+    }
+    Write-Host '[OK] Plink и PSCP 0.85 проверены.'
+}
+
 function Get-TftpExecutable {
+    $workPrefix = [IO.Path]::GetFullPath($WorkDir).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    Get-Process -Name tftpd64,tftpd32 -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($workPrefix,[StringComparison]::OrdinalIgnoreCase) } |
+        Stop-Process -Force
+    $found = Get-ChildItem -LiteralPath $WorkDir -Filter tftpd64.exe -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) {
+        Write-Host "Использую локальный Tftpd64: $($found.FullName)"
+        return $found.FullName
+    }
+
     New-Item -ItemType Directory -Path $TftpDir -Force | Out-Null
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     if (-not (Test-Path -LiteralPath $TftpZip) -or (Get-FileHash -LiteralPath $TftpZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $TftpZipHash) {
-        Write-Host 'Скачиваю официальный Tftpd64 Portable 4.74...'
+        Write-Host 'Локальный tftpd64.exe не найден; скачиваю официальный Tftpd64 Portable 4.74...'
         Invoke-WebRequest -Uri $TftpUrl -OutFile $TftpZip -UseBasicParsing
     }
     if ((Get-FileHash -LiteralPath $TftpZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $TftpZipHash) {
         Remove-Item -LiteralPath $TftpZip -Force -ErrorAction SilentlyContinue
         throw 'Архив Tftpd64 не прошёл проверку SHA-256.'
     }
-    $workPrefix = [IO.Path]::GetFullPath($WorkDir).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-    Get-Process -Name tftpd64,tftpd32 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -and $_.Path.StartsWith($workPrefix,[StringComparison]::OrdinalIgnoreCase) } |
-        Stop-Process -Force
     Expand-Archive -LiteralPath $TftpZip -DestinationPath $TftpDir -Force
     $found = Get-ChildItem -LiteralPath $TftpDir -Filter tftpd64.exe -File -Recurse | Select-Object -First 1
     if (-not $found) { throw 'В официальном архиве не найден tftpd64.exe.' }
@@ -181,54 +213,88 @@ function Invoke-Native([string]$Path, [string[]]$Arguments) {
     } finally { $ErrorActionPreference = $previousPreference }
 }
 
+function Get-RemoteHostFingerprints {
+    $lines = Invoke-Native $script:SshKeyScanPath @('-T','5','-p','22',$Router)
+    $keyLines = @($lines | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^\S+\s+\S+\s+[A-Za-z0-9+/=]+$' })
+    if (-not $keyLines.Count) { throw "Не удалось получить SSH host key от $Router." }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($keyLine in $keyLines) {
+            $keyData = ($keyLine -split '\s+')[2]
+            $fingerprint = [Convert]::ToBase64String($sha.ComputeHash([Convert]::FromBase64String($keyData))).TrimEnd([char[]]'=')
+            "SHA256:$fingerprint"
+        }
+    } finally { $sha.Dispose() }
+}
+
+function Get-PlinkArguments([string]$Command, [switch]$UsePassword) {
+    $arguments = @('-batch','-noagent','-no-antispoof')
+    foreach ($fingerprint in (Get-RemoteHostFingerprints)) { $arguments += @('-hostkey',$fingerprint) }
+    $arguments += @('-ssh','-P','22')
+    if ($UsePassword) {
+        if (-not $script:PasswordFile) { throw 'Пароль SSH ещё не задан.' }
+        $arguments += @('-pwfile',$script:PasswordFile)
+    }
+    $arguments += @('-l','root',$Router,$Command)
+    return $arguments
+}
+
 function Test-RemoteNoPasswordAuth {
-    $ssh = (Get-Command ssh -ErrorAction Stop).Source
-    $common = @('-o','PubkeyAuthentication=no','-o','ConnectTimeout=5','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','GlobalKnownHostsFile=NUL','-T',"root@$Router",'true')
-    Invoke-Native $ssh (@('-o','BatchMode=yes') + $common) *> $null
-    return ($script:NativeExitCode -eq 0)
+    try {
+        $arguments = Get-PlinkArguments 'true'
+        Invoke-Native $PlinkPath $arguments *> $null
+        return ($script:NativeExitCode -eq 0)
+    } catch { return $false }
 }
 
 function Ensure-RemoteAuth([switch]$InteractiveOnly) {
     if (-not $InteractiveOnly -and (Test-RemoteNoPasswordAuth)) { $script:UseNoPasswordAuth = $true; return }
-    $ssh = (Get-Command ssh -ErrorAction Stop).Source
-    $common = @('-o','PubkeyAuthentication=no','-o','ConnectTimeout=5','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','GlobalKnownHostsFile=NUL','-T',"root@$Router",'true')
-    Write-Host "Введите пароль root для $Router, если SSH его запросит."
-    Invoke-Native $ssh $common | Out-Host
-    if ($script:NativeExitCode -ne 0) { throw "SSH-аутентификация на $Router не удалась." }
+    if (-not $script:PasswordFile) {
+        Write-Host "Введите пароль root для $Router один раз; скрипт повторно использует его для SSH и SCP."
+        $securePassword = Read-Host 'Пароль root' -AsSecureString
+        $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
+        $passwordFile = Join-Path ([IO.Path]::GetTempPath()) ("netis-n6v2-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointer)
+            [IO.File]::WriteAllText($passwordFile,$plainPassword,[Text.UTF8Encoding]::new($false))
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
+            $plainPassword = $null
+        }
+        $script:PasswordFile = $passwordFile
+    }
     $script:UseNoPasswordAuth = $false
+    Invoke-Remote 'true'
 }
 
 function Invoke-Remote([string]$Command, [switch]$AllowDisconnect, [switch]$AllowUpgradeDisconnect) {
     Write-Host "SSH: $Command"
-    if ($script:UseNoPasswordAuth) {
-        $sshArguments = @('-o','PubkeyAuthentication=no','-o','BatchMode=yes','-o','ConnectTimeout=10','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','GlobalKnownHostsFile=NUL','-T',"root@$Router",$Command)
-    } else {
-        $sshArguments = @('-o','PubkeyAuthentication=no','-o','ConnectTimeout=10','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','GlobalKnownHostsFile=NUL','-T',"root@$Router",$Command)
-    }
-    $output = Invoke-Native ((Get-Command ssh).Source) $sshArguments
+    $arguments = if ($script:UseNoPasswordAuth) { Get-PlinkArguments $Command } else { Get-PlinkArguments $Command -UsePassword }
+    $output = Invoke-Native $PlinkPath $arguments
     $code = $script:NativeExitCode
     $text = $output -join "`n"
     if ($text) { $text | Out-Host }
-    if ($code -ne 0 -and -not $AllowDisconnect -and -not ($AllowUpgradeDisconnect -and ($code -eq 246 -or $text -match 'Commencing upgrade'))) {
-        throw "SSH завершился с кодом $code"
+    if ($code -ne 0 -and -not $AllowDisconnect -and -not ($AllowUpgradeDisconnect -and $text -match 'Commencing upgrade')) {
+        throw "Plink завершился с кодом $code"
     }
     return $text
 }
 
 function Save-Partition([int]$Index, [string]$Destination, [long]$ExpectedBytes) {
     Write-Host ("Дамп mtd{0}: {1:N0} байт" -f $Index, $ExpectedBytes)
-    $psi = [Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = (Get-Command ssh -ErrorAction Stop).Source
-    if ($script:UseNoPasswordAuth) {
-        $psi.Arguments = "-o PubkeyAuthentication=no -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o GlobalKnownHostsFile=NUL -T root@$Router cat /dev/mtd${Index}ro"
-    } else {
-        $psi.Arguments = "-o PubkeyAuthentication=no -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o GlobalKnownHostsFile=NUL -T root@$Router cat /dev/mtd${Index}ro"
+    $arguments = if ($script:UseNoPasswordAuth) { Get-PlinkArguments "cat /dev/mtd${Index}ro" } else { Get-PlinkArguments "cat /dev/mtd${Index}ro" -UsePassword }
+    $quotedArguments = $arguments | ForEach-Object {
+        $argument = [string]$_
+        if ($argument -match '[\s"]') { '"' + $argument.Replace('"','\"') + '"' } else { $argument }
     }
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $PlinkPath
+    $psi.Arguments = $quotedArguments -join ' '
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $psi
-    if (-not $process.Start()) { throw "Не удалось запустить SSH для mtd$Index" }
+    if (-not $process.Start()) { throw "Не удалось запустить Plink для mtd$Index" }
     $stream = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try { $process.StandardOutput.BaseStream.CopyTo($stream) }
     finally { $stream.Dispose() }
@@ -236,8 +302,21 @@ function Save-Partition([int]$Index, [string]$Destination, [long]$ExpectedBytes)
     $actual = (Get-Item -LiteralPath $Destination).Length
     if ($process.ExitCode -ne 0 -or $actual -ne $ExpectedBytes) {
         Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-        throw "Дамп mtd$Index не прошёл проверку размера/SSH-кода. Прошивка не начата."
+        throw "Дамп mtd$Index не прошёл проверку размера/Plink-кода. Прошивка не начата."
     }
+}
+
+function Send-Image([string]$Source, [string]$RemoteName) {
+    $arguments = @('-batch','-noagent')
+    foreach ($fingerprint in (Get-RemoteHostFingerprints)) { $arguments += @('-hostkey',$fingerprint) }
+    $arguments += @('-scp','-P','22')
+    if (-not $script:UseNoPasswordAuth) {
+        if (-not $script:PasswordFile) { throw 'Пароль SSH ещё не задан.' }
+        $arguments += @('-pwfile',$script:PasswordFile)
+    }
+    $arguments += @($Source,"root@${Router}:/tmp/$RemoteName")
+    Invoke-Native $PscpPath $arguments | Out-Host
+    if ($script:NativeExitCode -ne 0) { throw "Передача $RemoteName через PSCP не удалась." }
 }
 
 function Wait-ForSsh([int]$TimeoutSeconds, [string]$Message) {
@@ -292,6 +371,7 @@ function Wait-ForRecovery([int]$TimeoutSeconds) {
         } elseif ($sshAvailable -and $attempt -ge 6 -and -not $interactiveBoardAttempted) {
             $interactiveBoardAttempted = $true
             try {
+                Ensure-RemoteAuth -InteractiveOnly
                 $lastBoard = Invoke-Remote 'ubus call system board'
                 if ($lastBoard -match '"rootfs_type"\s*:\s*"initramfs"') { return }
             } catch { $lastBoard = $_.Exception.Message }
@@ -341,29 +421,10 @@ function Assert-PersistentRoot {
 }
 
 function Test-WindowsOpenSsh {
-    $commands = @{}
-    foreach ($name in 'ssh','scp') {
-        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $command) {
-            throw "Не найден компонент Windows OpenSSH ($name.exe). Установите Optional Feature 'OpenSSH Client' в Параметрах Windows и запустите сценарий снова."
-        }
-        $commands[$name] = $command.Source
-        Write-Host "[OK] $name`: $($command.Source)"
-    }
-    $sshPath = $commands['ssh']
-    $processInfo = [Diagnostics.ProcessStartInfo]::new()
-    $processInfo.FileName = $sshPath
-    $processInfo.Arguments = '-V'
-    $processInfo.UseShellExecute = $false
-    $processInfo.RedirectStandardOutput = $true
-    $processInfo.RedirectStandardError = $true
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $processInfo
-    if (-not $process.Start()) { throw 'Windows OpenSSH найден, но ssh.exe не запускается.' }
-    $version = ($process.StandardOutput.ReadToEnd() + $process.StandardError.ReadToEnd()).Trim()
-    $process.WaitForExit()
-    if ($process.ExitCode -ne 0 -or -not $version) { throw 'Windows OpenSSH найден, но ssh.exe не запускается.' }
-    Write-Host "[OK] $version"
+    $command = Get-Command ssh-keyscan -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { throw "Не найден ssh-keyscan.exe из Windows OpenSSH. Установите Optional Feature 'OpenSSH Client' и запустите сценарий снова." }
+    $script:SshKeyScanPath = $command.Source
+    Write-Host "[OK] ssh-keyscan: $($command.Source)"
 }
 
 try {
@@ -372,6 +433,7 @@ try {
     $fipPath = Require-Image $Fip
     $recoveryPath = Require-Image $Recovery
     $sysupgradePath = Require-Image $Sysupgrade
+    Get-PuTTYTools
     $tftpExe = Get-TftpExecutable
     Prepare-Tftp $tftpExe $recoveryPath
     Test-TftpFile
@@ -417,12 +479,7 @@ try {
     $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $backupDir 'manifest.json') -Encoding UTF8
     Write-Host "Дампы сохранены и проверены: $backupDir"
 
-    if ($script:UseNoPasswordAuth) {
-        Invoke-Native ((Get-Command scp).Source) @('-o','PubkeyAuthentication=no','-o','BatchMode=yes','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','GlobalKnownHostsFile=NUL','-O',$fipPath,"root@${Router}:/tmp/$Fip") | Out-Host
-    } else {
-        Invoke-Native ((Get-Command scp).Source) @('-o','PubkeyAuthentication=no','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','GlobalKnownHostsFile=NUL','-O',$fipPath,"root@${Router}:/tmp/$Fip") | Out-Host
-    }
-    if ($script:NativeExitCode -ne 0) { throw 'Передача FIP не удалась; роутер не изменён.' }
+    Send-Image $fipPath $Fip
     $fipHash = $Images[$Fip].Hash
     $remoteFipHash = Invoke-Remote "sha256sum /tmp/$Fip"
     if ($remoteFipHash -notmatch $fipHash) { throw 'SHA-256 переданного FIP не совпал; запись не выполнялась.' }
@@ -436,12 +493,7 @@ try {
     }
     Assert-RecoveryRoot
 
-    if ($script:UseNoPasswordAuth) {
-        Invoke-Native ((Get-Command scp).Source) @('-o','PubkeyAuthentication=no','-o','BatchMode=yes','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','GlobalKnownHostsFile=NUL','-O',$sysupgradePath,"root@${Router}:/tmp/$Sysupgrade") | Out-Host
-    } else {
-        Invoke-Native ((Get-Command scp).Source) @('-o','PubkeyAuthentication=no','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','GlobalKnownHostsFile=NUL','-O',$sysupgradePath,"root@${Router}:/tmp/$Sysupgrade") | Out-Host
-    }
-    if ($script:NativeExitCode -ne 0) { throw 'Передача sysupgrade не удалась. Recovery оставлена запущенной; повторно FIP/UBI не трогаю.' }
+    Send-Image $sysupgradePath $Sysupgrade
     $remoteSysupgradeHash = Invoke-Remote "sha256sum /tmp/$Sysupgrade"
     if ($remoteSysupgradeHash -notmatch $Images[$Sysupgrade].Hash) { throw 'SHA-256 переданного sysupgrade не совпал; upgrade не запускался.' }
     Invoke-Remote "sysupgrade -T /tmp/$Sysupgrade"
@@ -456,4 +508,5 @@ try {
 }
 finally {
     if ($script:FlashCompleted -and $script:TftpProcess -and -not $script:TftpProcess.HasExited) { Stop-Process -Id $script:TftpProcess.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:PasswordFile -and (Test-Path -LiteralPath $script:PasswordFile)) { Remove-Item -LiteralPath $script:PasswordFile -Force -ErrorAction SilentlyContinue }
 }
